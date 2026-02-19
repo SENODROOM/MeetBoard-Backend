@@ -1,9 +1,3 @@
--- Create database if not exists
-CREATE DATABASE rtc_app;
-
--- Connect to the database
-\c rtc_app;
-
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -91,5 +85,6 @@ END;
 $$ language 'plpgsql';
 
 -- Create trigger for users table
+DROP TRIGGER IF EXISTS update_users_updated_at ON users;
 CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
