@@ -4,10 +4,16 @@
     "description": "Real-time communication backend",
     "main": "dist/index.js",
     "scripts": {
-        "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+        "dev": "node scripts/start-docker.js && ts-node-dev --respawn --transpile-only src/index.ts",
+        "dev:local": "ts-node-dev --respawn --transpile-only src/index.ts",
         "build": "tsc",
         "start": "node dist/index.js",
-        "migrate": "node dist/scripts/migrate.js"
+        "migrate": "node dist/scripts/migrate.js",
+        "docker:start": "docker-compose up -d postgres mongodb redis minio",
+        "docker:stop": "docker-compose down",
+        "docker:restart": "npm run docker:stop && npm run docker:start",
+        "db:init": "docker-compose exec -T postgres psql -U rtc_user -d rtc_app < scripts/init-db.sql",
+        "setup": "node scripts/start-docker.js && npm run dev:local"
     },
     "dependencies": {
         "@aws-sdk/client-s3": "^3.478.0",

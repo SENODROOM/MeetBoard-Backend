@@ -32,7 +32,7 @@ const httpServer = createServer(app);
 // Socket.io setup
 const io = new Server(httpServer, {
     cors: {
-        origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+        origin: process.env.FRONTEND_URL?.split(',') || ['http://localhost:3000'],
         credentials: true,
     },
     maxHttpBufferSize: 1e8, // 100MB for file transfers
@@ -44,7 +44,7 @@ app.use(helmet({
 }));
 
 app.use(cors({
-    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+    origin: process.env.FRONTEND_URL?.split(',') || ['http://localhost:3000'],
     credentials: true,
 }));
 

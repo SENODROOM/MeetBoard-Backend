@@ -2,6 +2,7 @@ import { Response } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
+import { Pool } from 'pg';
 import { pgPool } from '../config/database';
 import { AuthRequest } from '../types';
 
