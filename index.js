@@ -119,6 +119,28 @@ io.on('connection', (socket) => {
     socket.to(roomId).emit('peer-video-toggle', { userId, socketId: socket.id, enabled });
   });
 
+  // ── Whiteboard signaling ─────────────────────────────────────────────────
+  socket.on('wb-join', ({ roomId }) => {
+    // Ask an existing peer in the room to send their canvas state
+    socket.to(roomId).emit('wb-request-canvas', { from: socket.id });
+  });
+
+  socket.on('wb-draw', (data) => {
+    socket.to(data.roomId).emit('wb-draw', data);
+  });
+
+  socket.on('wb-clear', ({ roomId }) => {
+    socket.to(roomId).emit('wb-clear');
+  });
+
+  socket.on('wb-cursor', (data) => {
+    socket.to(data.roomId).emit('wb-cursor', data);
+  });
+
+  socket.on('wb-canvas-state', ({ to, dataUrl }) => {
+    io.to(to).emit('wb-canvas-state', { dataUrl });
+  });
+
   // Disconnect
   socket.on('disconnect', () => {
     const meta = socketMeta.get(socket.id);
