@@ -174,6 +174,26 @@ io.on('connection', (socket) => {
     if (knockQueue.has(roomId)) knockQueue.get(roomId).delete(targetSocketId);
   });
 
+  // ── Host kicks a participant ───────────────────────────────────────────────
+  socket.on('kick-user', ({ roomId, targetSocketId }) => {
+    const meta = socketMeta.get(socket.id);
+    if (!meta) return;
+    // Only host can kick
+    if (roomHosts.get(roomId) !== socket.id) return;
+    io.to(targetSocketId).emit('kicked');
+    // Force disconnect from room
+    const targetSocket = io.sockets.sockets.get(targetSocketId);
+    if (targetSocket) {
+      targetSocket.leave(roomId);
+      const tMeta = socketMeta.get(targetSocketId);
+      if (tMeta) {
+        socket.to(roomId).emit('user-left', { socketId: targetSocketId, userName: tMeta.userName });
+        if (rooms.has(roomId)) rooms.get(roomId).delete(targetSocketId);
+        socketMeta.delete(targetSocketId);
+      }
+    }
+  });
+
   // ── WebRTC signaling ───────────────────────────────────────────────────────
   socket.on('offer',         ({ to, offer, from, userName }) => io.to(to).emit('offer', { from, offer, userName }));
   socket.on('answer',        ({ to, answer, from })          => io.to(to).emit('answer', { from, answer }));
@@ -194,10 +214,14 @@ io.on('connection', (socket) => {
 
   // ── Whiteboard ─────────────────────────────────────────────────────────────
   socket.on('wb-join', ({ roomId }) => socket.to(roomId).emit('wb-request-canvas', { from: socket.id }));
-  socket.on('wb-draw',         (data)         => socket.to(data.roomId).emit('wb-draw', data));
-  socket.on('wb-clear',        ({ roomId })   => socket.to(roomId).emit('wb-clear'));
-  socket.on('wb-cursor',       (data)         => socket.to(data.roomId).emit('wb-cursor', data));
-  socket.on('wb-canvas-state', ({ to, dataUrl }) => io.to(to).emit('wb-canvas-state', { dataUrl }));
+  socket.on('wb-draw',          (data)            => socket.to(data.roomId).emit('wb-draw', data));
+  socket.on('wb-clear',         ({ roomId })      => socket.to(roomId).emit('wb-clear'));
+  socket.on('wb-cursor',        (data)            => socket.to(data.roomId).emit('wb-cursor', data));
+  socket.on('wb-canvas-state',  ({ to, dataUrl }) => io.to(to).emit('wb-canvas-state', { dataUrl }));
+  socket.on('wb-image-drop',    (data)            => socket.to(data.roomId).emit('wb-image-drop', data));
+  socket.on('wb-image-move',    (data)            => socket.to(data.roomId).emit('wb-image-move', data));
+  socket.on('wb-image-resize',  (data)            => socket.to(data.roomId).emit('wb-image-resize', data));
+  socket.on('wb-image-delete',  (data)            => socket.to(data.roomId).emit('wb-image-delete', data));
 
   // ── Disconnect ────────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
