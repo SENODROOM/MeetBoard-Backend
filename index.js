@@ -223,6 +223,46 @@ io.on('connection', (socket) => {
   socket.on('wb-image-resize',  (data)            => socket.to(data.roomId).emit('wb-image-resize', data));
   socket.on('wb-image-delete',  (data)            => socket.to(data.roomId).emit('wb-image-delete', data));
 
+
+  // ── Host controls ──────────────────────────────────────────────────────────
+  // mute a specific user
+  socket.on('host-mute-user', ({ roomId, targetSocketId }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    io.to(targetSocketId).emit('force-mute');
+  });
+  // unmute a specific user
+  socket.on('host-unmute-user', ({ roomId, targetSocketId }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    io.to(targetSocketId).emit('force-unmute');
+  });
+  // mute everyone
+  socket.on('host-mute-all', ({ roomId }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    socket.to(roomId).emit('force-mute');
+  });
+  // stop a user's video
+  socket.on('host-stop-video', ({ roomId, targetSocketId }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    io.to(targetSocketId).emit('force-stop-video');
+  });
+  // toggle whiteboard permission for a user
+  socket.on('host-wb-permission', ({ roomId, targetSocketId, allowed }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    io.to(targetSocketId).emit('wb-permission', { allowed });
+  });
+  // lower all hands
+  socket.on('host-lower-all-hands', ({ roomId }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    socket.to(roomId).emit('lower-hand');
+  });
+  // raise / lower own hand
+  socket.on('raise-hand', ({ roomId, userName: uName }) => {
+    socket.to(roomId).emit('peer-hand-raise', { socketId: socket.id, userName: uName });
+  });
+  socket.on('lower-hand', ({ roomId }) => {
+    socket.to(roomId).emit('peer-hand-lower', { socketId: socket.id });
+  });
+
   // ── Disconnect ────────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
     const meta = socketMeta.get(socket.id);
