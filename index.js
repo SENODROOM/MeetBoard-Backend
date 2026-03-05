@@ -19,6 +19,11 @@ const io = new Server(server, {
 
 app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:3000', credentials: true }));
 app.use(express.json());
+app.use(express.static(require('path').join(__dirname, 'uploads')));
+
+// Classroom API
+const classroomRouter = require('./classroom');
+app.use('/api/classrooms', classroomRouter);
 
 // ─── MongoDB Models ───────────────────────────────────────────────────────────
 const roomSchema = new mongoose.Schema({
@@ -121,6 +126,8 @@ app.get('/api/rooms', async (req, res) => {
 app.get('/api/health', (_, res) => res.json({ status: 'ok', time: new Date() }));
 
 // ─── Socket.io ────────────────────────────────────────────────────────────────
+const secretQueue = new Map();
+
 io.on('connection', (socket) => {
   console.log(`[+] ${socket.id}`);
 
@@ -212,6 +219,10 @@ io.on('connection', (socket) => {
   socket.on('toggle-video', ({ roomId, userId, enabled }) =>
     socket.to(roomId).emit('peer-video-toggle', { userId, socketId: socket.id, enabled }));
 
+  // ── Emoji reactions ──────────────────────────────────────────────────────────
+  socket.on('room-reaction', ({ roomId, emoji, x, y }) =>
+    socket.to(roomId).emit('peer-reaction', { emoji, x, y }));
+
   // ── Whiteboard ─────────────────────────────────────────────────────────────
   socket.on('wb-join', ({ roomId }) => socket.to(roomId).emit('wb-request-canvas', { from: socket.id }));
   socket.on('wb-draw',          (data)            => socket.to(data.roomId).emit('wb-draw', data));
@@ -263,8 +274,39 @@ io.on('connection', (socket) => {
     socket.to(roomId).emit('peer-hand-lower', { socketId: socket.id });
   });
 
+
+  // ── SecretMeet — random pairing ────────────────────────────────────────────
+  socket.on('secret-join-queue', ({ userId, userName }) => {
+    // Already in queue? skip
+    if (secretQueue.has(socket.id)) return;
+    secretQueue.set(socket.id, { userId, userName, socketId: socket.id });
+
+    // Try to find a waiting partner
+    let partner = null;
+    for (const [sid, data] of secretQueue.entries()) {
+      if (sid !== socket.id) { partner = { sid, ...data }; break; }
+    }
+
+    if (partner) {
+      // Pair found — create a room and notify both
+      secretQueue.delete(socket.id);
+      secretQueue.delete(partner.sid);
+      const roomId = 'secret-' + require('uuid').v4().slice(0, 8);
+      io.to(socket.id).emit('secret-matched', { roomId, partnerName: partner.userName });
+      io.to(partner.sid).emit('secret-matched', { roomId, partnerName: userName });
+    } else {
+      socket.emit('secret-waiting');
+    }
+  });
+
+  socket.on('secret-leave-queue', () => {
+    secretQueue.delete(socket.id);
+    socket.emit('secret-cancelled');
+  });
+
   // ── Disconnect ────────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
+    secretQueue.delete(socket.id);
     const meta = socketMeta.get(socket.id);
     if (meta) {
       const { roomId, userName } = meta;
