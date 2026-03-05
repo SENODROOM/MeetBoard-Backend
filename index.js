@@ -19,11 +19,6 @@ const io = new Server(server, {
 
 app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:3000', credentials: true }));
 app.use(express.json());
-app.use(express.static(require('path').join(__dirname, 'uploads')));
-
-// Classroom API
-const classroomRouter = require('./classroom');
-app.use('/api/classrooms', classroomRouter);
 
 // ─── MongoDB Models ───────────────────────────────────────────────────────────
 const roomSchema = new mongoose.Schema({
