@@ -304,6 +304,129 @@ io.on('connection', (socket) => {
     socket.emit('secret-cancelled');
   });
 
+  // ── Transcription relay ───────────────────────────────────────────────────
+  socket.on('transcript-share', ({ roomId, text, speakerName, timestamp }) => {
+    socket.to(roomId).emit('transcript-line', { text, speakerName, timestamp });
+  });
+
+  // ── Transcription permission ──────────────────────────────────────────────
+  socket.on('host-grant-transcribe', ({ roomId, targetSocketId, allowed }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    io.to(targetSocketId).emit('transcribe-permission', { allowed });
+  });
+
+  // ── Breakout Rooms ────────────────────────────────────────────────────────
+  socket.on('breakout-create', ({ roomId, breakoutRooms }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    breakoutSessions.set(roomId, { rooms: breakoutRooms, active: true });
+    io.to(roomId).emit('breakout-started', { breakoutRooms });
+  });
+  socket.on('breakout-assign', ({ roomId, targetSocketId, breakoutRoomId }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    io.to(targetSocketId).emit('breakout-assigned', { breakoutRoomId });
+  });
+  socket.on('breakout-end', ({ roomId }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    breakoutSessions.delete(roomId);
+    io.to(roomId).emit('breakout-ended');
+  });
+  socket.on('breakout-broadcast', ({ roomId, message }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    io.to(roomId).emit('breakout-broadcast-msg', { message, from: 'Host' });
+  });
+  socket.on('breakout-call-back', ({ roomId }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    io.to(roomId).emit('breakout-callback');
+  });
+  socket.on('breakout-get', ({ roomId }) => {
+    const session = breakoutSessions.get(roomId);
+    socket.emit('breakout-state', session || null);
+  });
+
+  // ── Polls ─────────────────────────────────────────────────────────────────
+  socket.on('poll-create', ({ roomId, question, options }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!roomPolls.has(roomId)) roomPolls.set(roomId, []);
+    const poll = {
+      id: require('uuid').v4(),
+      question, active: true,
+      options: options.map(text => ({ text, votes: [] })),
+      createdBy: socketMeta.get(socket.id)?.userName,
+      createdAt: new Date(),
+    };
+    roomPolls.get(roomId).push(poll);
+    io.to(roomId).emit('poll-new', poll);
+  });
+  socket.on('poll-vote', ({ roomId, pollId, optionIndex, userId }) => {
+    const polls = roomPolls.get(roomId);
+    if (!polls) return;
+    const poll = polls.find(p => p.id === pollId);
+    if (!poll || !poll.active) return;
+    // Remove previous vote
+    poll.options.forEach(o => { o.votes = o.votes.filter(v => v !== userId); });
+    if (optionIndex >= 0 && optionIndex < poll.options.length)
+      poll.options[optionIndex].votes.push(userId);
+    io.to(roomId).emit('poll-updated', poll);
+  });
+  socket.on('poll-end', ({ roomId, pollId }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    const polls = roomPolls.get(roomId);
+    if (!polls) return;
+    const poll = polls.find(p => p.id === pollId);
+    if (poll) { poll.active = false; io.to(roomId).emit('poll-updated', poll); }
+  });
+  socket.on('poll-get-all', ({ roomId }) => {
+    socket.emit('poll-all', roomPolls.get(roomId) || []);
+  });
+
+  // ── Q&A ───────────────────────────────────────────────────────────────────
+  socket.on('qna-ask', ({ roomId, text, askerName, askerId, anonymous }) => {
+    if (!roomQnA.has(roomId)) roomQnA.set(roomId, []);
+    const q = {
+      id: require('uuid').v4(),
+      text, askerId,
+      askerName: anonymous ? 'Anonymous' : askerName,
+      upvotes: [], answered: false, pinned: false,
+      createdAt: new Date(),
+    };
+    roomQnA.get(roomId).push(q);
+    io.to(roomId).emit('qna-new', q);
+  });
+  socket.on('qna-upvote', ({ roomId, questionId, userId }) => {
+    const qs = roomQnA.get(roomId);
+    if (!qs) return;
+    const q = qs.find(x => x.id === questionId);
+    if (!q) return;
+    if (q.upvotes.includes(userId)) q.upvotes = q.upvotes.filter(v => v !== userId);
+    else q.upvotes.push(userId);
+    io.to(roomId).emit('qna-updated', q);
+  });
+  socket.on('qna-mark-answered', ({ roomId, questionId }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    const qs = roomQnA.get(roomId);
+    if (!qs) return;
+    const q = qs.find(x => x.id === questionId);
+    if (q) { q.answered = !q.answered; io.to(roomId).emit('qna-updated', q); }
+  });
+  socket.on('qna-pin', ({ roomId, questionId }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    const qs = roomQnA.get(roomId);
+    if (!qs) return;
+    qs.forEach(q => q.pinned = false);
+    const q = qs.find(x => x.id === questionId);
+    if (q) { q.pinned = !q.pinned; io.to(roomId).emit('qna-all', qs); }
+  });
+  socket.on('qna-dismiss', ({ roomId, questionId }) => {
+    if (roomHosts.get(roomId) !== socket.id) return;
+    const qs = roomQnA.get(roomId);
+    if (!qs) return;
+    roomQnA.set(roomId, qs.filter(q => q.id !== questionId));
+    io.to(roomId).emit('qna-all', roomQnA.get(roomId));
+  });
+  socket.on('qna-get-all', ({ roomId }) => {
+    socket.emit('qna-all', roomQnA.get(roomId) || []);
+  });
+
   // ── Disconnect ────────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
     secretQueue.delete(socket.id);
@@ -339,3 +462,22 @@ mongoose.connect(MONGO_URI)
     console.warn('⚠️  No DB, running in-memory:', err.message);
     server.listen(PORT, () => console.log(`🚀 Server on http://localhost:${PORT} (no DB)`));
   });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BREAKOUT ROOMS
+// ═══════════════════════════════════════════════════════════════════════════
+// Map: roomId → { rooms: [{id, name, participants:[socketId]}], active: bool }
+const breakoutSessions = new Map();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POLLS
+// ═══════════════════════════════════════════════════════════════════════════
+// Map: roomId → [{ id, question, options:[{text,votes:[userId]}], active, createdBy }]
+const roomPolls = new Map();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Q&A
+// ═══════════════════════════════════════════════════════════════════════════
+// Map: roomId → [{ id, text, askerName, askerId, upvotes:[userId], answered, pinned, createdAt }]
+const roomQnA = new Map();
+
