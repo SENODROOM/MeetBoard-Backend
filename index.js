@@ -66,6 +66,8 @@ const socketMeta = new Map();
 const roomHosts = new Map();
 // Map: roomId → Map<socketId, { userId, userName }> (pending knock requests)
 const knockQueue = new Map();
+// Map: roomId → boolean (isPublic) — in-memory fallback when DB is down
+const roomPrivacy = new Map();
 
 // ─── REST API ─────────────────────────────────────────────────────────────────
 // Create room
@@ -73,6 +75,11 @@ app.post('/api/rooms', async (req, res) => {
   try {
     const { userId, hostName, isPublic = true, title = '' } = req.body;
     const roomId = uuidv4().slice(0, 3) + '-' + uuidv4().slice(0, 4) + '-' + uuidv4().slice(0, 3);
+
+    // Always store privacy in-memory so the knock handler and live list
+    // work correctly even when MongoDB is unavailable.
+    roomPrivacy.set(roomId, isPublic === true || isPublic === 'true');
+
     try {
       const room = new Room({ roomId, host: userId, hostName, isPublic, title, participantCount: 0 });
       await room.save();
@@ -97,9 +104,13 @@ app.get('/api/rooms/:roomId', async (req, res) => {
     // Also get live participant count from in-memory
     const liveCount = rooms.has(req.params.roomId) ? rooms.get(req.params.roomId).size : 0;
     if (roomData) return res.json({ ...roomData.toObject(), participantCount: liveCount });
-    // Fallback: if DB is down, check in-memory
+    // Fallback: if DB is down, check in-memory.
+    // Use the privacy map so private rooms stay private even without DB.
     if (rooms.has(req.params.roomId)) {
-      return res.json({ roomId: req.params.roomId, isPublic: true, participantCount: liveCount });
+      const isPublic = roomPrivacy.has(req.params.roomId)
+        ? roomPrivacy.get(req.params.roomId)
+        : false; // default to private (safe) if unknown
+      return res.json({ roomId: req.params.roomId, isPublic, participantCount: liveCount });
     }
     res.status(404).json({ error: 'Room not found' });
   } catch (err) {
@@ -107,7 +118,7 @@ app.get('/api/rooms/:roomId', async (req, res) => {
   }
 });
 
-// List public live rooms (Live Streams)
+// List public live rooms (Live tab)
 app.get('/api/rooms', async (req, res) => {
   try {
     // Get all rooms that have active participants
@@ -115,6 +126,7 @@ app.get('/api/rooms', async (req, res) => {
 
     let publicRooms = [];
     try {
+      // DB query already filters by isPublic: true — private rooms are excluded
       const dbRooms = await Room.find({ roomId: { $in: liveRoomIds }, isPublic: true });
       publicRooms = dbRooms.map(r => ({
         roomId: r.roomId,
@@ -125,15 +137,17 @@ app.get('/api/rooms', async (req, res) => {
         createdAt: r.createdAt,
       }));
     } catch (e) {
-      // DB down — return in-memory public rooms (all treated as public)
-      publicRooms = liveRoomIds.map(id => ({
-        roomId: id,
-        title: `Meeting ${id}`,
-        hostName: 'Host',
-        isPublic: true,
-        participantCount: rooms.get(id).size,
-        createdAt: new Date(),
-      }));
+      // DB down — use in-memory privacy map to filter; never expose private rooms
+      publicRooms = liveRoomIds
+        .filter(id => roomPrivacy.get(id) === true)
+        .map(id => ({
+          roomId: id,
+          title: `Meeting ${id}`,
+          hostName: 'Host',
+          isPublic: true,
+          participantCount: rooms.get(id).size,
+          createdAt: new Date(),
+        }));
     }
     res.json(publicRooms);
   } catch (err) {
@@ -183,8 +197,9 @@ io.on('connection', (socket) => {
     if (hostSocketId) {
       io.to(hostSocketId).emit('knock-request', { socketId: socket.id, userId, userName });
     } else {
-      // No host connected yet — auto-admit
-      socket.emit('knock-accepted', { roomId });
+      // No host connected yet — keep the user waiting.
+      // Do NOT auto-admit: the host must approve entry for private rooms.
+      socket.emit('knock-waiting', { roomId });
     }
   });
 
@@ -198,6 +213,17 @@ io.on('connection', (socket) => {
   socket.on('reject-user', ({ roomId, socketId: targetSocketId }) => {
     io.to(targetSocketId).emit('knock-rejected', { roomId });
     if (knockQueue.has(roomId)) knockQueue.get(roomId).delete(targetSocketId);
+  });
+
+  // ── When host joins, notify any pending knockers so they know help arrived ─
+  // (knockers are already in the queue; host joining triggers knock-request
+  //  delivery for all queued users so the host can admit/reject them)
+  socket.on('host-joined', ({ roomId }) => {
+    const queue = knockQueue.get(roomId);
+    if (!queue) return;
+    queue.forEach(({ socketId: kSid, userId: kUid, userName: kName }) => {
+      socket.emit('knock-request', { socketId: kSid, userId: kUid, userName: kName });
+    });
   });
 
   // ── Host kicks a participant ───────────────────────────────────────────────
@@ -458,6 +484,7 @@ io.on('connection', (socket) => {
         if (rooms.get(roomId).size === 0) {
           rooms.delete(roomId);
           knockQueue.delete(roomId);
+          roomPrivacy.delete(roomId);
         }
       }
       if (roomHosts.get(roomId) === socket.id) roomHosts.delete(roomId);
@@ -499,4 +526,3 @@ const roomPolls = new Map();
 // ═══════════════════════════════════════════════════════════════════════════
 // Map: roomId → [{ id, text, askerName, askerId, upvotes:[userId], answered, pinned, createdAt }]
 const roomQnA = new Map();
-
