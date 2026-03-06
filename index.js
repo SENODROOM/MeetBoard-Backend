@@ -10,12 +10,10 @@ const app = express();
 const server = http.createServer(app);
 
 const allowedOrigins = [
-  process.env.CLIENT_URL,
   'https://meet.quantumlogicslimited.com',
   'https://www.meet.quantumlogicslimited.com',
-  'https://www.meet.quantumlogicslimited.com/',
   'http://localhost:3000',
-].filter(Boolean);
+];
 
 const io = new Server(server, {
   cors: {
@@ -24,17 +22,21 @@ const io = new Server(server, {
     credentials: true,
   },
 });
-const corsOptions = {
+
+app.use(cors({
   origin: (origin, callback) => {
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      callback(new Error('CORS: origin not allowed → ' + origin));
     }
   },
   credentials: true,
-};
-app.use(cors(corsOptions));
+}));
+
+// Explicitly handle OPTIONS preflight for all routes
+app.options('*', cors());
+
 app.use(express.json());
 app.use(express.static(require('path').join(__dirname, 'uploads')));
 
