@@ -287,12 +287,10 @@ io.on("connection", (socket) => {
       targetSocket.leave(roomId);
       const tMeta = socketMeta.get(targetSocketId);
       if (tMeta) {
-        socket
-          .to(roomId)
-          .emit("user-left", {
-            socketId: targetSocketId,
-            userName: tMeta.userName,
-          });
+        socket.to(roomId).emit("user-left", {
+          socketId: targetSocketId,
+          userName: tMeta.userName,
+        });
         if (rooms.has(roomId)) rooms.get(roomId).delete(targetSocketId);
         socketMeta.delete(targetSocketId);
       }
