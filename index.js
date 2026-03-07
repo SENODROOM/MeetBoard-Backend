@@ -13,6 +13,7 @@ const allowedOrigins = [
   'https://meet.quantumlogicslimited.com',
   'https://www.meet.quantumlogicslimited.com',
   'http://localhost:3000',
+  'http://localhost:5001',
 ];
 
 const io = new Server(server, {
