@@ -247,6 +247,11 @@ io.on("connection", (socket) => {
     }
   });
 
+  // ── Screen share signalling ───────────────────────────────────────────────────
+  // Relay to all other participants so they know to clear the screen tile.
+  socket.on("screen-share-stopped", ({ roomId }) => {
+    socket.to(roomId).emit("peer-screen-stopped", { socketId: socket.id });
+  });
   // ── Host accepts knock ────────────────────────────────────────────────────
   socket.on("admit-user", ({ roomId, socketId: targetSocketId }) => {
     io.to(targetSocketId).emit("knock-accepted", { roomId });
