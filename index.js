@@ -84,8 +84,6 @@ app.post("/api/rooms", async (req, res) => {
       "-" +
       uuidv4().slice(0, 3);
 
-    // Always store privacy in-memory so the knock handler and live list
-    // work correctly even when MongoDB is unavailable.
     roomPrivacy.set(roomId, isPublic === true || isPublic === "true");
 
     try {
@@ -118,18 +116,15 @@ app.get("/api/rooms/:roomId", async (req, res) => {
     try {
       roomData = await Room.findOne({ roomId: req.params.roomId });
     } catch (e) {}
-    // Also get live participant count from in-memory
     const liveCount = rooms.has(req.params.roomId)
       ? rooms.get(req.params.roomId).size
       : 0;
     if (roomData)
       return res.json({ ...roomData.toObject(), participantCount: liveCount });
-    // Fallback: if DB is down, check in-memory.
-    // Use the privacy map so private rooms stay private even without DB.
     if (rooms.has(req.params.roomId)) {
       const isPublic = roomPrivacy.has(req.params.roomId)
         ? roomPrivacy.get(req.params.roomId)
-        : false; // default to private (safe) if unknown
+        : false;
       return res.json({
         roomId: req.params.roomId,
         isPublic,
@@ -145,14 +140,12 @@ app.get("/api/rooms/:roomId", async (req, res) => {
 // List public live rooms (Live tab)
 app.get("/api/rooms", async (req, res) => {
   try {
-    // Get all rooms that have active participants
     const liveRoomIds = [...rooms.keys()].filter(
       (id) => rooms.get(id).size > 0,
     );
 
     let publicRooms = [];
     try {
-      // DB query already filters by isPublic: true — private rooms are excluded
       const dbRooms = await Room.find({
         roomId: { $in: liveRoomIds },
         isPublic: true,
@@ -166,7 +159,6 @@ app.get("/api/rooms", async (req, res) => {
         createdAt: r.createdAt,
       }));
     } catch (e) {
-      // DB down — use in-memory privacy map to filter; never expose private rooms
       publicRooms = liveRoomIds
         .filter((id) => roomPrivacy.get(id) === true)
         .map((id) => ({
@@ -195,7 +187,7 @@ const secretQueue = new Map();
 io.on("connection", (socket) => {
   console.log(`[+] ${socket.id}`);
 
-  // ── Join room (used by public rooms or after host accepts knock) ────────────
+  // ── Join room ────────────────────────────────────────────────────────────────
   socket.on("join-room", ({ roomId, userId, userName, isHost }) => {
     socket.join(roomId);
     socketMeta.set(socket.id, { roomId, userId, userName });
@@ -215,7 +207,6 @@ io.on("connection", (socket) => {
     });
     socket.emit("existing-peers", peers);
 
-    // Update DB participant count
     Room.findOneAndUpdate(
       { roomId },
       { participantCount: rooms.get(roomId).size },
@@ -225,14 +216,13 @@ io.on("connection", (socket) => {
     );
   });
 
-  // ── Knock (private room entry request) ────────────────────────────────────
+  // ── Knock ────────────────────────────────────────────────────────────────────
   socket.on("knock", ({ roomId, userId, userName }) => {
     if (!knockQueue.has(roomId)) knockQueue.set(roomId, new Map());
     knockQueue
       .get(roomId)
       .set(socket.id, { userId, userName, socketId: socket.id });
 
-    // Notify host
     const hostSocketId = roomHosts.get(roomId);
     if (hostSocketId) {
       io.to(hostSocketId).emit("knock-request", {
@@ -241,32 +231,28 @@ io.on("connection", (socket) => {
         userName,
       });
     } else {
-      // No host connected yet — keep the user waiting.
-      // Do NOT auto-admit: the host must approve entry for private rooms.
       socket.emit("knock-waiting", { roomId });
     }
   });
 
   // ── Screen share signalling ───────────────────────────────────────────────────
-  // Relay to all other participants so they know to clear the screen tile.
   socket.on("screen-share-stopped", ({ roomId }) => {
     socket.to(roomId).emit("peer-screen-stopped", { socketId: socket.id });
   });
-  // ── Host accepts knock ────────────────────────────────────────────────────
+
+  // ── Host accepts knock ────────────────────────────────────────────────────────
   socket.on("admit-user", ({ roomId, socketId: targetSocketId }) => {
     io.to(targetSocketId).emit("knock-accepted", { roomId });
     if (knockQueue.has(roomId)) knockQueue.get(roomId).delete(targetSocketId);
   });
 
-  // ── Host rejects knock ────────────────────────────────────────────────────
+  // ── Host rejects knock ────────────────────────────────────────────────────────
   socket.on("reject-user", ({ roomId, socketId: targetSocketId }) => {
     io.to(targetSocketId).emit("knock-rejected", { roomId });
     if (knockQueue.has(roomId)) knockQueue.get(roomId).delete(targetSocketId);
   });
 
-  // ── When host joins, notify any pending knockers so they know help arrived ─
-  // (knockers are already in the queue; host joining triggers knock-request
-  //  delivery for all queued users so the host can admit/reject them)
+  // ── When host joins, notify pending knockers ──────────────────────────────────
   socket.on("host-joined", ({ roomId }) => {
     const queue = knockQueue.get(roomId);
     if (!queue) return;
@@ -279,14 +265,12 @@ io.on("connection", (socket) => {
     });
   });
 
-  // ── Host kicks a participant ───────────────────────────────────────────────
+  // ── Host kicks a participant ──────────────────────────────────────────────────
   socket.on("kick-user", ({ roomId, targetSocketId }) => {
     const meta = socketMeta.get(socket.id);
     if (!meta) return;
-    // Only host can kick
     if (roomHosts.get(roomId) !== socket.id) return;
     io.to(targetSocketId).emit("kicked");
-    // Force disconnect from room
     const targetSocket = io.sockets.sockets.get(targetSocketId);
     if (targetSocket) {
       targetSocket.leave(roomId);
@@ -302,7 +286,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // ── WebRTC signaling ───────────────────────────────────────────────────────
+  // ── WebRTC signaling ──────────────────────────────────────────────────────────
   socket.on("offer", ({ to, offer, from, userName }) =>
     io.to(to).emit("offer", { from, offer, userName }),
   );
@@ -313,7 +297,7 @@ io.on("connection", (socket) => {
     io.to(to).emit("ice-candidate", { from, candidate }),
   );
 
-  // ── Chat ────────────────────────────────────────────────────────────────
+  // ── Chat ──────────────────────────────────────────────────────────────────────
   socket.on("chat-message", ({ roomId, message, userName, userId }) => {
     io.to(roomId).emit("chat-message", {
       id: uuidv4(),
@@ -324,13 +308,7 @@ io.on("connection", (socket) => {
     });
   });
 
-  // ── Screen share signalling ───────────────────────────────────────────────────
-  // Relay to all other participants so they know to clear the screen tile.
-  socket.on("screen-share-stopped", ({ roomId }) => {
-    socket.to(roomId).emit("peer-screen-stopped", { socketId: socket.id });
-  });
-
-  // ── Media toggles ──────────────────────────────────────────────────────────
+  // ── Media toggles ─────────────────────────────────────────────────────────────
   socket.on("toggle-audio", ({ roomId, userId, enabled }) =>
     socket
       .to(roomId)
@@ -342,12 +320,12 @@ io.on("connection", (socket) => {
       .emit("peer-video-toggle", { userId, socketId: socket.id, enabled }),
   );
 
-  // ── Emoji reactions ──────────────────────────────────────────────────────────
+  // ── Emoji reactions ───────────────────────────────────────────────────────────
   socket.on("room-reaction", ({ roomId, emoji, x, y }) =>
     socket.to(roomId).emit("peer-reaction", { emoji, x, y }),
   );
 
-  // ── Whiteboard ─────────────────────────────────────────────────────────────
+  // ── Whiteboard ────────────────────────────────────────────────────────────────
   socket.on("wb-join", ({ roomId }) =>
     socket.to(roomId).emit("wb-request-canvas", { from: socket.id }),
   );
@@ -372,38 +350,40 @@ io.on("connection", (socket) => {
     socket.to(data.roomId).emit("wb-image-delete", data),
   );
 
-  // ── Host controls ──────────────────────────────────────────────────────────
-  // mute a specific user
+  // ── Whiteboard drawing indicator ──────────────────────────────────────────────
+  // Relay to all OTHER peers so they see the green dot on the Board button
+  socket.on("wb-drawing-start", (data) =>
+    socket.to(data.roomId).emit("wb-drawing-start", data),
+  );
+  socket.on("wb-drawing-stop", (data) =>
+    socket.to(data.roomId).emit("wb-drawing-stop", data),
+  );
+
+  // ── Host controls ─────────────────────────────────────────────────────────────
   socket.on("host-mute-user", ({ roomId, targetSocketId }) => {
     if (roomHosts.get(roomId) !== socket.id) return;
     io.to(targetSocketId).emit("force-mute");
   });
-  // unmute a specific user
   socket.on("host-unmute-user", ({ roomId, targetSocketId }) => {
     if (roomHosts.get(roomId) !== socket.id) return;
     io.to(targetSocketId).emit("force-unmute");
   });
-  // mute everyone
   socket.on("host-mute-all", ({ roomId }) => {
     if (roomHosts.get(roomId) !== socket.id) return;
     socket.to(roomId).emit("force-mute");
   });
-  // stop a user's video
   socket.on("host-stop-video", ({ roomId, targetSocketId }) => {
     if (roomHosts.get(roomId) !== socket.id) return;
     io.to(targetSocketId).emit("force-stop-video");
   });
-  // toggle whiteboard permission for a user
   socket.on("host-wb-permission", ({ roomId, targetSocketId, allowed }) => {
     if (roomHosts.get(roomId) !== socket.id) return;
     io.to(targetSocketId).emit("wb-permission", { allowed });
   });
-  // lower all hands
   socket.on("host-lower-all-hands", ({ roomId }) => {
     if (roomHosts.get(roomId) !== socket.id) return;
     socket.to(roomId).emit("lower-hand");
   });
-  // raise / lower own hand
   socket.on("raise-hand", ({ roomId, userName: uName }) => {
     socket
       .to(roomId)
@@ -413,13 +393,11 @@ io.on("connection", (socket) => {
     socket.to(roomId).emit("peer-hand-lower", { socketId: socket.id });
   });
 
-  // ── SecretMeet — random pairing ────────────────────────────────────────────
+  // ── SecretMeet — random pairing ───────────────────────────────────────────────
   socket.on("secret-join-queue", ({ userId, userName }) => {
-    // Already in queue? skip
     if (secretQueue.has(socket.id)) return;
     secretQueue.set(socket.id, { userId, userName, socketId: socket.id });
 
-    // Try to find a waiting partner
     let partner = null;
     for (const [sid, data] of secretQueue.entries()) {
       if (sid !== socket.id) {
@@ -429,7 +407,6 @@ io.on("connection", (socket) => {
     }
 
     if (partner) {
-      // Pair found — create a room and notify both
       secretQueue.delete(socket.id);
       secretQueue.delete(partner.sid);
       const roomId = "secret-" + require("uuid").v4().slice(0, 8);
@@ -451,18 +428,18 @@ io.on("connection", (socket) => {
     socket.emit("secret-cancelled");
   });
 
-  // ── Transcription relay ───────────────────────────────────────────────────
+  // ── Transcription relay ───────────────────────────────────────────────────────
   socket.on("transcript-share", ({ roomId, text, speakerName, timestamp }) => {
     socket.to(roomId).emit("transcript-line", { text, speakerName, timestamp });
   });
 
-  // ── Transcription permission ──────────────────────────────────────────────
+  // ── Transcription permission ──────────────────────────────────────────────────
   socket.on("host-grant-transcribe", ({ roomId, targetSocketId, allowed }) => {
     if (roomHosts.get(roomId) !== socket.id) return;
     io.to(targetSocketId).emit("transcribe-permission", { allowed });
   });
 
-  // ── Breakout Rooms ────────────────────────────────────────────────────────
+  // ── Breakout Rooms ────────────────────────────────────────────────────────────
   socket.on("breakout-create", ({ roomId, breakoutRooms }) => {
     if (roomHosts.get(roomId) !== socket.id) return;
     breakoutSessions.set(roomId, { rooms: breakoutRooms, active: true });
@@ -490,7 +467,7 @@ io.on("connection", (socket) => {
     socket.emit("breakout-state", session || null);
   });
 
-  // ── Polls ─────────────────────────────────────────────────────────────────
+  // ── Polls ─────────────────────────────────────────────────────────────────────
   socket.on("poll-create", ({ roomId, question, options }) => {
     if (roomHosts.get(roomId) !== socket.id) return;
     if (!roomPolls.has(roomId)) roomPolls.set(roomId, []);
@@ -510,7 +487,6 @@ io.on("connection", (socket) => {
     if (!polls) return;
     const poll = polls.find((p) => p.id === pollId);
     if (!poll || !poll.active) return;
-    // Remove previous vote
     poll.options.forEach((o) => {
       o.votes = o.votes.filter((v) => v !== userId);
     });
@@ -532,7 +508,7 @@ io.on("connection", (socket) => {
     socket.emit("poll-all", roomPolls.get(roomId) || []);
   });
 
-  // ── Q&A ───────────────────────────────────────────────────────────────────
+  // ── Q&A ───────────────────────────────────────────────────────────────────────
   socket.on("qna-ask", ({ roomId, text, askerName, askerId, anonymous }) => {
     if (!roomQnA.has(roomId)) roomQnA.set(roomId, []);
     const q = {
@@ -593,12 +569,14 @@ io.on("connection", (socket) => {
     socket.emit("qna-all", roomQnA.get(roomId) || []);
   });
 
-  // ── Disconnect ────────────────────────────────────────────────────────────
+  // ── Disconnect ────────────────────────────────────────────────────────────────
   socket.on("disconnect", () => {
     secretQueue.delete(socket.id);
     const meta = socketMeta.get(socket.id);
     if (meta) {
       const { roomId, userName } = meta;
+      // If this user was drawing, broadcast stop to their room
+      socket.to(roomId).emit("wb-drawing-stop", { roomId, from: socket.id });
       socket.to(roomId).emit("user-left", { socketId: socket.id, userName });
       if (rooms.has(roomId)) {
         rooms.get(roomId).delete(socket.id);
@@ -642,17 +620,14 @@ mongoose
 // ═══════════════════════════════════════════════════════════════════════════
 // BREAKOUT ROOMS
 // ═══════════════════════════════════════════════════════════════════════════
-// Map: roomId → { rooms: [{id, name, participants:[socketId]}], active: bool }
 const breakoutSessions = new Map();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // POLLS
 // ═══════════════════════════════════════════════════════════════════════════
-// Map: roomId → [{ id, question, options:[{text,votes:[userId]}], active, createdBy }]
 const roomPolls = new Map();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Q&A
 // ═══════════════════════════════════════════════════════════════════════════
-// Map: roomId → [{ id, text, askerName, askerId, upvotes:[userId], answered, pinned, createdAt }]
 const roomQnA = new Map();
