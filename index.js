@@ -65,8 +65,10 @@ const Room = mongoose.model("Room", roomSchema);
 const rooms = new Map();
 // Map: socketId → { roomId, userId, userName }
 const socketMeta = new Map();
-// Map: roomId → hostSocketId
+// Map: roomId → hostUserId  (persistent across reconnects — keyed by userId, not socketId)
 const roomHosts = new Map();
+// Map: roomId → current host socketId (updated on each join/rejoin)
+const roomHostSockets = new Map();
 // Map: roomId → Map<socketId, { userId, userName }> (pending knock requests)
 const knockQueue = new Map();
 // Map: roomId → boolean (isPublic) — in-memory fallback when DB is down
@@ -115,7 +117,7 @@ app.get("/api/rooms/:roomId", async (req, res) => {
     let roomData = null;
     try {
       roomData = await Room.findOne({ roomId: req.params.roomId });
-    } catch (e) {}
+    } catch (e) { }
     const liveCount = rooms.has(req.params.roomId)
       ? rooms.get(req.params.roomId).size
       : 0;
@@ -195,7 +197,13 @@ io.on("connection", (socket) => {
     if (!rooms.has(roomId)) rooms.set(roomId, new Map());
     rooms.get(roomId).set(socket.id, { socketId: socket.id, userId, userName });
 
-    if (isHost) roomHosts.set(roomId, socket.id);
+    // Restore host if userId matches stored hostUserId (handles page refresh / rejoin)
+    const storedHostUserId = roomHosts.get(roomId);
+    const resolvedIsHost = isHost || storedHostUserId === userId;
+    if (resolvedIsHost) {
+      roomHosts.set(roomId, userId);
+      roomHostSockets.set(roomId, socket.id);
+    }
 
     socket
       .to(roomId)
@@ -207,23 +215,76 @@ io.on("connection", (socket) => {
     });
     socket.emit("existing-peers", peers);
 
+    // Tell the client if they were auto-restored as host, and send any
+    // pending knock requests so they can admit waiting users right away.
+    if (resolvedIsHost) {
+      socket.emit("host-status-confirmed", { isHost: true });
+      const pendingKnocks = knockQueue.get(roomId);
+      if (pendingKnocks && pendingKnocks.size > 0) {
+        pendingKnocks.forEach(({ socketId: kSid, userId: kUid, userName: kName }) => {
+          socket.emit("knock-request", { socketId: kSid, userId: kUid, userName: kName });
+        });
+      }
+    }
+
     Room.findOneAndUpdate(
       { roomId },
       { participantCount: rooms.get(roomId).size },
-    ).catch(() => {});
+    ).catch(() => { });
     console.log(
-      `[room:${roomId}] ${userName} joined. Total: ${rooms.get(roomId).size}`,
+      `[room:${roomId}] ${userName} joined${resolvedIsHost ? " (host)" : ""}. Total: ${rooms.get(roomId).size}`,
     );
+  });
+
+  // ── Rejoin room (socket reconnected — re-register without full re-join) ────────
+  socket.on("rejoin-room", ({ roomId, userId, userName }) => {
+    socket.join(roomId);
+    socketMeta.set(socket.id, { roomId, userId, userName });
+
+    if (!rooms.has(roomId)) rooms.set(roomId, new Map());
+    rooms.get(roomId).set(socket.id, { socketId: socket.id, userId, userName });
+
+    // Restore host if this user was the host
+    const storedHostUserId = roomHosts.get(roomId);
+    if (storedHostUserId === userId) {
+      roomHostSockets.set(roomId, socket.id);
+      socket.emit("host-status-confirmed", { isHost: true });
+      // Also flush any pending knock requests to the reconnected host
+      const pendingKnocks = knockQueue.get(roomId);
+      if (pendingKnocks && pendingKnocks.size > 0) {
+        pendingKnocks.forEach(({ socketId: kSid, userId: kUid, userName: kName }) => {
+          socket.emit("knock-request", { socketId: kSid, userId: kUid, userName: kName });
+        });
+      }
+    }
+
+    // Notify other peers this user came back
+    socket.to(roomId).emit("user-rejoined", { socketId: socket.id, userId, userName });
+
+    // Send current peers to the rejoining user
+    const peers = [];
+    rooms.get(roomId).forEach((peer, sid) => {
+      if (sid !== socket.id) peers.push(peer);
+    });
+    socket.emit("existing-peers", peers);
+
+    console.log(`[room:${roomId}] ${userName} rejoined. Total: ${rooms.get(roomId).size}`);
   });
 
   // ── Knock ────────────────────────────────────────────────────────────────────
   socket.on("knock", ({ roomId, userId, userName }) => {
+    // If the knocking user is the stored host, admit immediately
+    if (roomHosts.get(roomId) === userId) {
+      socket.emit("knock-accepted", { roomId });
+      return;
+    }
+
     if (!knockQueue.has(roomId)) knockQueue.set(roomId, new Map());
     knockQueue
       .get(roomId)
       .set(socket.id, { userId, userName, socketId: socket.id });
 
-    const hostSocketId = roomHosts.get(roomId);
+    const hostSocketId = roomHostSockets.get(roomId);
     if (hostSocketId) {
       io.to(hostSocketId).emit("knock-request", {
         socketId: socket.id,
@@ -254,6 +315,11 @@ io.on("connection", (socket) => {
 
   // ── When host joins, notify pending knockers ──────────────────────────────────
   socket.on("host-joined", ({ roomId }) => {
+    // Update host socket mapping
+    const meta = socketMeta.get(socket.id);
+    if (meta && roomHosts.get(roomId) === meta.userId) {
+      roomHostSockets.set(roomId, socket.id);
+    }
     const queue = knockQueue.get(roomId);
     if (!queue) return;
     queue.forEach(({ socketId: kSid, userId: kUid, userName: kName }) => {
@@ -269,7 +335,7 @@ io.on("connection", (socket) => {
   socket.on("kick-user", ({ roomId, targetSocketId }) => {
     const meta = socketMeta.get(socket.id);
     if (!meta) return;
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (roomHosts.get(roomId) !== meta.userId) return;
     io.to(targetSocketId).emit("kicked");
     const targetSocket = io.sockets.sockets.get(targetSocketId);
     if (targetSocket) {
@@ -360,28 +426,34 @@ io.on("connection", (socket) => {
   );
 
   // ── Host controls ─────────────────────────────────────────────────────────────
+  // Helper: check if the socket's user is the host of the room
+  const isRoomHost = (rId) => {
+    const m = socketMeta.get(socket.id);
+    return m && roomHosts.get(rId) === m.userId;
+  };
+
   socket.on("host-mute-user", ({ roomId, targetSocketId }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     io.to(targetSocketId).emit("force-mute");
   });
   socket.on("host-unmute-user", ({ roomId, targetSocketId }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     io.to(targetSocketId).emit("force-unmute");
   });
   socket.on("host-mute-all", ({ roomId }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     socket.to(roomId).emit("force-mute");
   });
   socket.on("host-stop-video", ({ roomId, targetSocketId }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     io.to(targetSocketId).emit("force-stop-video");
   });
   socket.on("host-wb-permission", ({ roomId, targetSocketId, allowed }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     io.to(targetSocketId).emit("wb-permission", { allowed });
   });
   socket.on("host-lower-all-hands", ({ roomId }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     socket.to(roomId).emit("lower-hand");
   });
   socket.on("raise-hand", ({ roomId, userName: uName }) => {
@@ -435,31 +507,31 @@ io.on("connection", (socket) => {
 
   // ── Transcription permission ──────────────────────────────────────────────────
   socket.on("host-grant-transcribe", ({ roomId, targetSocketId, allowed }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     io.to(targetSocketId).emit("transcribe-permission", { allowed });
   });
 
   // ── Breakout Rooms ────────────────────────────────────────────────────────────
   socket.on("breakout-create", ({ roomId, breakoutRooms }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     breakoutSessions.set(roomId, { rooms: breakoutRooms, active: true });
     io.to(roomId).emit("breakout-started", { breakoutRooms });
   });
   socket.on("breakout-assign", ({ roomId, targetSocketId, breakoutRoomId }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     io.to(targetSocketId).emit("breakout-assigned", { breakoutRoomId });
   });
   socket.on("breakout-end", ({ roomId }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     breakoutSessions.delete(roomId);
     io.to(roomId).emit("breakout-ended");
   });
   socket.on("breakout-broadcast", ({ roomId, message }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     io.to(roomId).emit("breakout-broadcast-msg", { message, from: "Host" });
   });
   socket.on("breakout-call-back", ({ roomId }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     io.to(roomId).emit("breakout-callback");
   });
   socket.on("breakout-get", ({ roomId }) => {
@@ -469,7 +541,7 @@ io.on("connection", (socket) => {
 
   // ── Polls ─────────────────────────────────────────────────────────────────────
   socket.on("poll-create", ({ roomId, question, options }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     if (!roomPolls.has(roomId)) roomPolls.set(roomId, []);
     const poll = {
       id: require("uuid").v4(),
@@ -495,7 +567,7 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("poll-updated", poll);
   });
   socket.on("poll-end", ({ roomId, pollId }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     const polls = roomPolls.get(roomId);
     if (!polls) return;
     const poll = polls.find((p) => p.id === pollId);
@@ -535,7 +607,7 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("qna-updated", q);
   });
   socket.on("qna-mark-answered", ({ roomId, questionId }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     const qs = roomQnA.get(roomId);
     if (!qs) return;
     const q = qs.find((x) => x.id === questionId);
@@ -545,7 +617,7 @@ io.on("connection", (socket) => {
     }
   });
   socket.on("qna-pin", ({ roomId, questionId }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     const qs = roomQnA.get(roomId);
     if (!qs) return;
     qs.forEach((q) => (q.pinned = false));
@@ -556,7 +628,7 @@ io.on("connection", (socket) => {
     }
   });
   socket.on("qna-dismiss", ({ roomId, questionId }) => {
-    if (roomHosts.get(roomId) !== socket.id) return;
+    if (!isRoomHost(roomId)) return;
     const qs = roomQnA.get(roomId);
     if (!qs) return;
     roomQnA.set(
@@ -570,11 +642,11 @@ io.on("connection", (socket) => {
   });
 
   // ── Disconnect ────────────────────────────────────────────────────────────────
-  socket.on("disconnect", () => {
+  socket.on("disconnect", (reason) => {
     secretQueue.delete(socket.id);
     const meta = socketMeta.get(socket.id);
     if (meta) {
-      const { roomId, userName } = meta;
+      const { roomId, userId, userName } = meta;
       // If this user was drawing, broadcast stop to their room
       socket.to(roomId).emit("wb-drawing-stop", { roomId, from: socket.id });
       socket.to(roomId).emit("user-left", { socketId: socket.id, userName });
@@ -584,15 +656,22 @@ io.on("connection", (socket) => {
           rooms.delete(roomId);
           knockQueue.delete(roomId);
           roomPrivacy.delete(roomId);
+          // Room is empty — purge host records too
+          roomHosts.delete(roomId);
+          roomHostSockets.delete(roomId);
         }
       }
-      if (roomHosts.get(roomId) === socket.id) roomHosts.delete(roomId);
+      // Only clear hostSocket mapping if this socket was the current host socket.
+      // Keep roomHosts (userId) so the host can rejoin and be auto-recognized.
+      if (roomHostSockets.get(roomId) === socket.id) {
+        roomHostSockets.delete(roomId);
+      }
       socketMeta.delete(socket.id);
       Room.findOneAndUpdate(
         { roomId },
         { participantCount: rooms.has(roomId) ? rooms.get(roomId).size : 0 },
-      ).catch(() => {});
-      console.log(`[-] ${userName} left ${roomId}`);
+      ).catch(() => { });
+      console.log(`[-] ${userName} (${reason}) left ${roomId}`);
     }
   });
 });
