@@ -74,6 +74,11 @@ const knockQueue = new Map();
 // Map: roomId → boolean (isPublic) — in-memory fallback when DB is down
 const roomPrivacy = new Map();
 
+// FIX: Track userId → socketId mapping so we can detect when the same userId
+// reconnects with a new socketId and clean up the stale entry.
+// Map: roomId → Map<userId, socketId>
+const roomUserSockets = new Map();
+
 // ─── REST API ─────────────────────────────────────────────────────────────────
 // Create room
 app.post("/api/rooms", async (req, res) => {
@@ -117,7 +122,7 @@ app.get("/api/rooms/:roomId", async (req, res) => {
     let roomData = null;
     try {
       roomData = await Room.findOne({ roomId: req.params.roomId });
-    } catch (e) { }
+    } catch (e) {}
     const liveCount = rooms.has(req.params.roomId)
       ? rooms.get(req.params.roomId).size
       : 0;
@@ -197,6 +202,10 @@ io.on("connection", (socket) => {
     if (!rooms.has(roomId)) rooms.set(roomId, new Map());
     rooms.get(roomId).set(socket.id, { socketId: socket.id, userId, userName });
 
+    // Track userId → socketId
+    if (!roomUserSockets.has(roomId)) roomUserSockets.set(roomId, new Map());
+    roomUserSockets.get(roomId).set(userId, socket.id);
+
     // Restore host if userId matches stored hostUserId (handles page refresh / rejoin)
     const storedHostUserId = roomHosts.get(roomId);
     const resolvedIsHost = isHost || storedHostUserId === userId;
@@ -221,28 +230,71 @@ io.on("connection", (socket) => {
       socket.emit("host-status-confirmed", { isHost: true });
       const pendingKnocks = knockQueue.get(roomId);
       if (pendingKnocks && pendingKnocks.size > 0) {
-        pendingKnocks.forEach(({ socketId: kSid, userId: kUid, userName: kName }) => {
-          socket.emit("knock-request", { socketId: kSid, userId: kUid, userName: kName });
-        });
+        pendingKnocks.forEach(
+          ({ socketId: kSid, userId: kUid, userName: kName }) => {
+            socket.emit("knock-request", {
+              socketId: kSid,
+              userId: kUid,
+              userName: kName,
+            });
+          },
+        );
       }
     }
 
     Room.findOneAndUpdate(
       { roomId },
       { participantCount: rooms.get(roomId).size },
-    ).catch(() => { });
+    ).catch(() => {});
     console.log(
       `[room:${roomId}] ${userName} joined${resolvedIsHost ? " (host)" : ""}. Total: ${rooms.get(roomId).size}`,
     );
   });
 
-  // ── Rejoin room (socket reconnected — re-register without full re-join) ────────
+  // ── Rejoin room (socket reconnected — re-register without full re-join) ──────
+  // FIX: When a user's internet drops and comes back, Socket.IO gives them a
+  // NEW socket.id. We need to:
+  //   1. Find and remove their OLD socket.id entry from the room (if it still
+  //      exists — the disconnect handler may have already cleaned it up, but
+  //      if the disconnect fired first we just skip).
+  //   2. Register the new socket.id.
+  //   3. Broadcast user-rejoined to other peers so they can rebuild WebRTC.
+  //   4. Send existing-peers back to the rejoining user.
+  //
+  // We do NOT emit user-left for the old socket here — the disconnect handler
+  // already did that. If it didn't (e.g. very fast reconnect), we emit it now
+  // for the old socket to clean up ghost entries on other clients.
   socket.on("rejoin-room", ({ roomId, userId, userName }) => {
     socket.join(roomId);
     socketMeta.set(socket.id, { roomId, userId, userName });
 
     if (!rooms.has(roomId)) rooms.set(roomId, new Map());
+    if (!roomUserSockets.has(roomId)) roomUserSockets.set(roomId, new Map());
+
+    const userSocketMap = roomUserSockets.get(roomId);
+    const oldSocketId = userSocketMap.get(userId);
+
+    // If the old socketId is still registered (fast reconnect before disconnect
+    // fired), clean it up now and notify peers so they remove the stale entry.
+    if (oldSocketId && oldSocketId !== socket.id) {
+      if (rooms.get(roomId).has(oldSocketId)) {
+        rooms.get(roomId).delete(oldSocketId);
+        socketMeta.delete(oldSocketId);
+        // Tell peers to remove the ghost tile for the OLD socket.
+        // We use a targeted emit so the rejoining user's own new socket doesn't
+        // receive it (they'll rebuild from existing-peers).
+        socket
+          .to(roomId)
+          .emit("user-left", { socketId: oldSocketId, userName });
+        console.log(
+          `[room:${roomId}] cleaned stale socket ${oldSocketId} for ${userName}`,
+        );
+      }
+    }
+
+    // Register new socket
     rooms.get(roomId).set(socket.id, { socketId: socket.id, userId, userName });
+    userSocketMap.set(userId, socket.id);
 
     // Restore host if this user was the host
     const storedHostUserId = roomHosts.get(roomId);
@@ -252,23 +304,41 @@ io.on("connection", (socket) => {
       // Also flush any pending knock requests to the reconnected host
       const pendingKnocks = knockQueue.get(roomId);
       if (pendingKnocks && pendingKnocks.size > 0) {
-        pendingKnocks.forEach(({ socketId: kSid, userId: kUid, userName: kName }) => {
-          socket.emit("knock-request", { socketId: kSid, userId: kUid, userName: kName });
-        });
+        pendingKnocks.forEach(
+          ({ socketId: kSid, userId: kUid, userName: kName }) => {
+            socket.emit("knock-request", {
+              socketId: kSid,
+              userId: kUid,
+              userName: kName,
+            });
+          },
+        );
       }
     }
 
-    // Notify other peers this user came back
-    socket.to(roomId).emit("user-rejoined", { socketId: socket.id, userId, userName });
+    // Notify other peers this user came back with their NEW socketId.
+    // Other clients will use this to rebuild the WebRTC connection.
+    socket.to(roomId).emit("user-rejoined", {
+      socketId: socket.id,
+      userId,
+      userName,
+    });
 
-    // Send current peers to the rejoining user
+    // Send current peer list to the rejoining user so they can rebuild
+    // all their outbound WebRTC connections.
     const peers = [];
     rooms.get(roomId).forEach((peer, sid) => {
       if (sid !== socket.id) peers.push(peer);
     });
     socket.emit("existing-peers", peers);
 
-    console.log(`[room:${roomId}] ${userName} rejoined. Total: ${rooms.get(roomId).size}`);
+    Room.findOneAndUpdate(
+      { roomId },
+      { participantCount: rooms.get(roomId).size },
+    ).catch(() => {});
+    console.log(
+      `[room:${roomId}] ${userName} rejoined (new sid: ${socket.id}). Total: ${rooms.get(roomId).size}`,
+    );
   });
 
   // ── Knock ────────────────────────────────────────────────────────────────────
@@ -280,9 +350,21 @@ io.on("connection", (socket) => {
     }
 
     if (!knockQueue.has(roomId)) knockQueue.set(roomId, new Map());
-    knockQueue
-      .get(roomId)
-      .set(socket.id, { userId, userName, socketId: socket.id });
+    const queue = knockQueue.get(roomId);
+
+    // FIX: Remove any stale knock entry for this userId (same person, old socket).
+    // This happens when a user leaves and re-enters, or their socket reconnected
+    // mid-knock. Without this, the host sees a dead socket ID and Admit does nothing.
+    for (const [sid, entry] of queue.entries()) {
+      if (entry.userId === userId && sid !== socket.id) {
+        queue.delete(sid);
+        console.log(
+          `[room:${roomId}] replaced stale knock for ${userName} (old sid: ${sid})`,
+        );
+      }
+    }
+
+    queue.set(socket.id, { userId, userName, socketId: socket.id });
 
     const hostSocketId = roomHostSockets.get(roomId);
     if (hostSocketId) {
@@ -302,15 +384,63 @@ io.on("connection", (socket) => {
   });
 
   // ── Host accepts knock ────────────────────────────────────────────────────────
+  // FIX: The knock queue is keyed by the guest's socket.id at knock time.
+  // If the guest's socket reconnected between knocking and being admitted,
+  // targetSocketId is stale and the knock-accepted message goes nowhere.
+  // Solution: find the guest's CURRENT socket.id via roomUserSockets (userId map),
+  // falling back to the original socketId if they haven't reconnected.
   socket.on("admit-user", ({ roomId, socketId: targetSocketId }) => {
-    io.to(targetSocketId).emit("knock-accepted", { roomId });
-    if (knockQueue.has(roomId)) knockQueue.get(roomId).delete(targetSocketId);
+    // Validate the caller is actually the host
+    const meta = socketMeta.get(socket.id);
+    if (!meta || roomHosts.get(roomId) !== meta.userId) return;
+
+    // Find the knock queue entry — it was stored by original socket.id
+    const queue = knockQueue.get(roomId);
+    let resolvedSocketId = targetSocketId;
+    let knockEntry = null;
+
+    if (queue) {
+      knockEntry = queue.get(targetSocketId);
+      if (knockEntry) {
+        // Try to resolve the guest's current socket ID via their userId
+        const userSocketMap = roomUserSockets.get(roomId);
+        if (userSocketMap && knockEntry.userId) {
+          const currentSid = userSocketMap.get(knockEntry.userId);
+          if (currentSid) resolvedSocketId = currentSid;
+        }
+        queue.delete(targetSocketId);
+        // Also remove by resolved ID in case they re-knocked with a new socket
+        if (resolvedSocketId !== targetSocketId) queue.delete(resolvedSocketId);
+      }
+    }
+
+    io.to(resolvedSocketId).emit("knock-accepted", { roomId });
+    console.log(
+      `[room:${roomId}] admitted ${knockEntry?.userName || targetSocketId} (sid: ${resolvedSocketId})`,
+    );
   });
 
   // ── Host rejects knock ────────────────────────────────────────────────────────
   socket.on("reject-user", ({ roomId, socketId: targetSocketId }) => {
-    io.to(targetSocketId).emit("knock-rejected", { roomId });
-    if (knockQueue.has(roomId)) knockQueue.get(roomId).delete(targetSocketId);
+    const meta = socketMeta.get(socket.id);
+    if (!meta || roomHosts.get(roomId) !== meta.userId) return;
+
+    const queue = knockQueue.get(roomId);
+    let resolvedSocketId = targetSocketId;
+    if (queue) {
+      const entry = queue.get(targetSocketId);
+      if (entry) {
+        const userSocketMap = roomUserSockets.get(roomId);
+        if (userSocketMap && entry.userId) {
+          const currentSid = userSocketMap.get(entry.userId);
+          if (currentSid) resolvedSocketId = currentSid;
+        }
+        queue.delete(targetSocketId);
+        if (resolvedSocketId !== targetSocketId) queue.delete(resolvedSocketId);
+      }
+    }
+
+    io.to(resolvedSocketId).emit("knock-rejected", { roomId });
   });
 
   // ── When host joins, notify pending knockers ──────────────────────────────────
@@ -347,6 +477,10 @@ io.on("connection", (socket) => {
           userName: tMeta.userName,
         });
         if (rooms.has(roomId)) rooms.get(roomId).delete(targetSocketId);
+        // Clean up userId → socketId mapping
+        if (roomUserSockets.has(roomId)) {
+          roomUserSockets.get(roomId).delete(tMeta.userId);
+        }
         socketMeta.delete(targetSocketId);
       }
     }
@@ -417,7 +551,6 @@ io.on("connection", (socket) => {
   );
 
   // ── Whiteboard drawing indicator ──────────────────────────────────────────────
-  // Relay to all OTHER peers so they see the green dot on the Board button
   socket.on("wb-drawing-start", (data) =>
     socket.to(data.roomId).emit("wb-drawing-start", data),
   );
@@ -426,7 +559,6 @@ io.on("connection", (socket) => {
   );
 
   // ── Host controls ─────────────────────────────────────────────────────────────
-  // Helper: check if the socket's user is the host of the room
   const isRoomHost = (rId) => {
     const m = socketMeta.get(socket.id);
     return m && roomHosts.get(rId) === m.userId;
@@ -656,6 +788,7 @@ io.on("connection", (socket) => {
           rooms.delete(roomId);
           knockQueue.delete(roomId);
           roomPrivacy.delete(roomId);
+          roomUserSockets.delete(roomId);
           // Room is empty — purge host records too
           roomHosts.delete(roomId);
           roomHostSockets.delete(roomId);
@@ -666,11 +799,20 @@ io.on("connection", (socket) => {
       if (roomHostSockets.get(roomId) === socket.id) {
         roomHostSockets.delete(roomId);
       }
+      // Clean up userId → socketId mapping only if it still points to THIS socket.
+      // If the user already reconnected with a new socket the mapping will already
+      // point to the new socketId and we must NOT delete it.
+      if (roomUserSockets.has(roomId)) {
+        const userSocketMap = roomUserSockets.get(roomId);
+        if (userSocketMap.get(userId) === socket.id) {
+          userSocketMap.delete(userId);
+        }
+      }
       socketMeta.delete(socket.id);
       Room.findOneAndUpdate(
         { roomId },
         { participantCount: rooms.has(roomId) ? rooms.get(roomId).size : 0 },
-      ).catch(() => { });
+      ).catch(() => {});
       console.log(`[-] ${userName} (${reason}) left ${roomId}`);
     }
   });
