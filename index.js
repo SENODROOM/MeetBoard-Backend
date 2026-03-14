@@ -3,6 +3,7 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
+const helmet = require("helmet");
 const mongoose = require("mongoose");
 const { v4: uuidv4 } = require("uuid");
 
@@ -24,6 +25,15 @@ const io = new Server(server, {
   },
 });
 
+// ── Security headers ──────────────────────────────────────────────────────────
+// Adds X-Frame-Options, X-XSS-Protection, Content-Security-Policy, etc.
+app.use(
+  helmet({
+    // Allow socket.io's long-polling and WebSocket connections
+    contentSecurityPolicy: false,
+  }),
+);
+
 app.use(
   cors({
     origin: (origin, callback) => {
@@ -43,7 +53,11 @@ app.options("*", cors());
 app.use(express.json());
 app.use(express.static(require("path").join(__dirname, "uploads")));
 
-// Classroom API
+// ── Auth routes (public — no JWT required) ────────────────────────────────────
+const authRouter = require("./routes/authRoutes");
+app.use("/api/auth", authRouter);
+
+// ── Classroom API (JWT protected — see classroom.js) ─────────────────────────
 const classroomRouter = require("./classroom");
 app.use("/api/classrooms", classroomRouter);
 
@@ -60,24 +74,30 @@ const roomSchema = new mongoose.Schema({
 });
 const Room = mongoose.model("Room", roomSchema);
 
-// ─── In-memory state ─────────────────────────────────────────────────────────
+// ─── In-memory state ──────────────────────────────────────────────────────────
 // Map: roomId → Map<socketId, { socketId, userId, userName }>
 const rooms = new Map();
 // Map: socketId → { roomId, userId, userName }
 const socketMeta = new Map();
-// Map: roomId → hostUserId  (persistent across reconnects — keyed by userId, not socketId)
+// Map: roomId → hostUserId
 const roomHosts = new Map();
-// Map: roomId → current host socketId (updated on each join/rejoin)
+// Map: roomId → current host socketId
 const roomHostSockets = new Map();
 // Map: roomId → Map<socketId, { userId, userName }> (pending knock requests)
 const knockQueue = new Map();
-// Map: roomId → boolean (isPublic) — in-memory fallback when DB is down
+// Map: roomId → boolean (isPublic)
 const roomPrivacy = new Map();
-
-// FIX: Track userId → socketId mapping so we can detect when the same userId
-// reconnects with a new socketId and clean up the stale entry.
 // Map: roomId → Map<userId, socketId>
 const roomUserSockets = new Map();
+// Map: roomId → Message[] (in-memory chat — auto-cleared when room empties)
+const roomMessages = new Map();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BREAKOUT / POLLS / Q&A state
+// ═══════════════════════════════════════════════════════════════════════════
+const breakoutSessions = new Map();
+const roomPolls = new Map();
+const roomQnA = new Map();
 
 // ─── REST API ─────────────────────────────────────────────────────────────────
 // Create room
@@ -144,13 +164,12 @@ app.get("/api/rooms/:roomId", async (req, res) => {
   }
 });
 
-// List public live rooms (Live tab)
+// List public live rooms
 app.get("/api/rooms", async (req, res) => {
   try {
     const liveRoomIds = [...rooms.keys()].filter(
       (id) => rooms.get(id).size > 0,
     );
-
     let publicRooms = [];
     try {
       const dbRooms = await Room.find({
@@ -202,11 +221,9 @@ io.on("connection", (socket) => {
     if (!rooms.has(roomId)) rooms.set(roomId, new Map());
     rooms.get(roomId).set(socket.id, { socketId: socket.id, userId, userName });
 
-    // Track userId → socketId
     if (!roomUserSockets.has(roomId)) roomUserSockets.set(roomId, new Map());
     roomUserSockets.get(roomId).set(userId, socket.id);
 
-    // Restore host if userId matches stored hostUserId (handles page refresh / rejoin)
     const storedHostUserId = roomHosts.get(roomId);
     const resolvedIsHost = isHost || storedHostUserId === userId;
     if (resolvedIsHost) {
@@ -224,8 +241,9 @@ io.on("connection", (socket) => {
     });
     socket.emit("existing-peers", peers);
 
-    // Tell the client if they were auto-restored as host, and send any
-    // pending knock requests so they can admit waiting users right away.
+    // Send chat history to the new participant
+    socket.emit("chat-history", roomMessages.get(roomId) || []);
+
     if (resolvedIsHost) {
       socket.emit("host-status-confirmed", { isHost: true });
       const pendingKnocks = knockQueue.get(roomId);
@@ -251,19 +269,7 @@ io.on("connection", (socket) => {
     );
   });
 
-  // ── Rejoin room (socket reconnected — re-register without full re-join) ──────
-  // FIX: When a user's internet drops and comes back, Socket.IO gives them a
-  // NEW socket.id. We need to:
-  //   1. Find and remove their OLD socket.id entry from the room (if it still
-  //      exists — the disconnect handler may have already cleaned it up, but
-  //      if the disconnect fired first we just skip).
-  //   2. Register the new socket.id.
-  //   3. Broadcast user-rejoined to other peers so they can rebuild WebRTC.
-  //   4. Send existing-peers back to the rejoining user.
-  //
-  // We do NOT emit user-left for the old socket here — the disconnect handler
-  // already did that. If it didn't (e.g. very fast reconnect), we emit it now
-  // for the old socket to clean up ghost entries on other clients.
+  // ── Rejoin room ──────────────────────────────────────────────────────────────
   socket.on("rejoin-room", ({ roomId, userId, userName }) => {
     socket.join(roomId);
     socketMeta.set(socket.id, { roomId, userId, userName });
@@ -274,15 +280,10 @@ io.on("connection", (socket) => {
     const userSocketMap = roomUserSockets.get(roomId);
     const oldSocketId = userSocketMap.get(userId);
 
-    // If the old socketId is still registered (fast reconnect before disconnect
-    // fired), clean it up now and notify peers so they remove the stale entry.
     if (oldSocketId && oldSocketId !== socket.id) {
       if (rooms.get(roomId).has(oldSocketId)) {
         rooms.get(roomId).delete(oldSocketId);
         socketMeta.delete(oldSocketId);
-        // Tell peers to remove the ghost tile for the OLD socket.
-        // We use a targeted emit so the rejoining user's own new socket doesn't
-        // receive it (they'll rebuild from existing-peers).
         socket
           .to(roomId)
           .emit("user-left", { socketId: oldSocketId, userName });
@@ -292,16 +293,13 @@ io.on("connection", (socket) => {
       }
     }
 
-    // Register new socket
     rooms.get(roomId).set(socket.id, { socketId: socket.id, userId, userName });
     userSocketMap.set(userId, socket.id);
 
-    // Restore host if this user was the host
     const storedHostUserId = roomHosts.get(roomId);
     if (storedHostUserId === userId) {
       roomHostSockets.set(roomId, socket.id);
       socket.emit("host-status-confirmed", { isHost: true });
-      // Also flush any pending knock requests to the reconnected host
       const pendingKnocks = knockQueue.get(roomId);
       if (pendingKnocks && pendingKnocks.size > 0) {
         pendingKnocks.forEach(
@@ -316,21 +314,18 @@ io.on("connection", (socket) => {
       }
     }
 
-    // Notify other peers this user came back with their NEW socketId.
-    // Other clients will use this to rebuild the WebRTC connection.
-    socket.to(roomId).emit("user-rejoined", {
-      socketId: socket.id,
-      userId,
-      userName,
-    });
+    socket
+      .to(roomId)
+      .emit("user-rejoined", { socketId: socket.id, userId, userName });
 
-    // Send current peer list to the rejoining user so they can rebuild
-    // all their outbound WebRTC connections.
     const peers = [];
     rooms.get(roomId).forEach((peer, sid) => {
       if (sid !== socket.id) peers.push(peer);
     });
     socket.emit("existing-peers", peers);
+
+    // Send chat history on rejoin too
+    socket.emit("chat-history", roomMessages.get(roomId) || []);
 
     Room.findOneAndUpdate(
       { roomId },
@@ -343,7 +338,6 @@ io.on("connection", (socket) => {
 
   // ── Knock ────────────────────────────────────────────────────────────────────
   socket.on("knock", ({ roomId, userId, userName }) => {
-    // If the knocking user is the stored host, admit immediately
     if (roomHosts.get(roomId) === userId) {
       socket.emit("knock-accepted", { roomId });
       return;
@@ -352,9 +346,6 @@ io.on("connection", (socket) => {
     if (!knockQueue.has(roomId)) knockQueue.set(roomId, new Map());
     const queue = knockQueue.get(roomId);
 
-    // FIX: Remove any stale knock entry for this userId (same person, old socket).
-    // This happens when a user leaves and re-enters, or their socket reconnected
-    // mid-knock. Without this, the host sees a dead socket ID and Admit does nothing.
     for (const [sid, entry] of queue.entries()) {
       if (entry.userId === userId && sid !== socket.id) {
         queue.delete(sid);
@@ -378,23 +369,16 @@ io.on("connection", (socket) => {
     }
   });
 
-  // ── Screen share signalling ───────────────────────────────────────────────────
+  // ── Screen share ─────────────────────────────────────────────────────────────
   socket.on("screen-share-stopped", ({ roomId }) => {
     socket.to(roomId).emit("peer-screen-stopped", { socketId: socket.id });
   });
 
-  // ── Host accepts knock ────────────────────────────────────────────────────────
-  // FIX: The knock queue is keyed by the guest's socket.id at knock time.
-  // If the guest's socket reconnected between knocking and being admitted,
-  // targetSocketId is stale and the knock-accepted message goes nowhere.
-  // Solution: find the guest's CURRENT socket.id via roomUserSockets (userId map),
-  // falling back to the original socketId if they haven't reconnected.
+  // ── Admit / reject knock ──────────────────────────────────────────────────────
   socket.on("admit-user", ({ roomId, socketId: targetSocketId }) => {
-    // Validate the caller is actually the host
     const meta = socketMeta.get(socket.id);
     if (!meta || roomHosts.get(roomId) !== meta.userId) return;
 
-    // Find the knock queue entry — it was stored by original socket.id
     const queue = knockQueue.get(roomId);
     let resolvedSocketId = targetSocketId;
     let knockEntry = null;
@@ -402,14 +386,12 @@ io.on("connection", (socket) => {
     if (queue) {
       knockEntry = queue.get(targetSocketId);
       if (knockEntry) {
-        // Try to resolve the guest's current socket ID via their userId
         const userSocketMap = roomUserSockets.get(roomId);
         if (userSocketMap && knockEntry.userId) {
           const currentSid = userSocketMap.get(knockEntry.userId);
           if (currentSid) resolvedSocketId = currentSid;
         }
         queue.delete(targetSocketId);
-        // Also remove by resolved ID in case they re-knocked with a new socket
         if (resolvedSocketId !== targetSocketId) queue.delete(resolvedSocketId);
       }
     }
@@ -420,7 +402,6 @@ io.on("connection", (socket) => {
     );
   });
 
-  // ── Host rejects knock ────────────────────────────────────────────────────────
   socket.on("reject-user", ({ roomId, socketId: targetSocketId }) => {
     const meta = socketMeta.get(socket.id);
     if (!meta || roomHosts.get(roomId) !== meta.userId) return;
@@ -439,13 +420,10 @@ io.on("connection", (socket) => {
         if (resolvedSocketId !== targetSocketId) queue.delete(resolvedSocketId);
       }
     }
-
     io.to(resolvedSocketId).emit("knock-rejected", { roomId });
   });
 
-  // ── When host joins, notify pending knockers ──────────────────────────────────
   socket.on("host-joined", ({ roomId }) => {
-    // Update host socket mapping
     const meta = socketMeta.get(socket.id);
     if (meta && roomHosts.get(roomId) === meta.userId) {
       roomHostSockets.set(roomId, socket.id);
@@ -461,7 +439,7 @@ io.on("connection", (socket) => {
     });
   });
 
-  // ── Host kicks a participant ──────────────────────────────────────────────────
+  // ── Kick ──────────────────────────────────────────────────────────────────────
   socket.on("kick-user", ({ roomId, targetSocketId }) => {
     const meta = socketMeta.get(socket.id);
     if (!meta) return;
@@ -472,15 +450,15 @@ io.on("connection", (socket) => {
       targetSocket.leave(roomId);
       const tMeta = socketMeta.get(targetSocketId);
       if (tMeta) {
-        socket.to(roomId).emit("user-left", {
-          socketId: targetSocketId,
-          userName: tMeta.userName,
-        });
+        socket
+          .to(roomId)
+          .emit("user-left", {
+            socketId: targetSocketId,
+            userName: tMeta.userName,
+          });
         if (rooms.has(roomId)) rooms.get(roomId).delete(targetSocketId);
-        // Clean up userId → socketId mapping
-        if (roomUserSockets.has(roomId)) {
+        if (roomUserSockets.has(roomId))
           roomUserSockets.get(roomId).delete(tMeta.userId);
-        }
         socketMeta.delete(targetSocketId);
       }
     }
@@ -499,13 +477,24 @@ io.on("connection", (socket) => {
 
   // ── Chat ──────────────────────────────────────────────────────────────────────
   socket.on("chat-message", ({ roomId, message, userName, userId }) => {
-    io.to(roomId).emit("chat-message", {
+    // FIX: message length cap — prevents memory abuse from huge pastes
+    if (!message?.trim() || message.length > 2000) return;
+
+    const msg = {
       id: uuidv4(),
-      message,
+      message: message.trim(),
       userName,
       userId,
       timestamp: new Date().toISOString(),
-    });
+    };
+
+    // Store in-memory, capped at 200 messages per room
+    if (!roomMessages.has(roomId)) roomMessages.set(roomId, []);
+    const history = roomMessages.get(roomId);
+    history.push(msg);
+    if (history.length > 200) history.shift();
+
+    io.to(roomId).emit("chat-message", msg);
   });
 
   // ── Media toggles ─────────────────────────────────────────────────────────────
@@ -549,8 +538,6 @@ io.on("connection", (socket) => {
   socket.on("wb-image-delete", (data) =>
     socket.to(data.roomId).emit("wb-image-delete", data),
   );
-
-  // ── Whiteboard drawing indicator ──────────────────────────────────────────────
   socket.on("wb-drawing-start", (data) =>
     socket.to(data.roomId).emit("wb-drawing-start", data),
   );
@@ -588,16 +575,16 @@ io.on("connection", (socket) => {
     if (!isRoomHost(roomId)) return;
     socket.to(roomId).emit("lower-hand");
   });
-  socket.on("raise-hand", ({ roomId, userName: uName }) => {
+  socket.on("raise-hand", ({ roomId, userName: uName }) =>
     socket
       .to(roomId)
-      .emit("peer-hand-raise", { socketId: socket.id, userName: uName });
-  });
-  socket.on("lower-hand", ({ roomId }) => {
-    socket.to(roomId).emit("peer-hand-lower", { socketId: socket.id });
-  });
+      .emit("peer-hand-raise", { socketId: socket.id, userName: uName }),
+  );
+  socket.on("lower-hand", ({ roomId }) =>
+    socket.to(roomId).emit("peer-hand-lower", { socketId: socket.id }),
+  );
 
-  // ── SecretMeet — random pairing ───────────────────────────────────────────────
+  // ── SecretMeet ────────────────────────────────────────────────────────────────
   socket.on("secret-join-queue", ({ userId, userName }) => {
     if (secretQueue.has(socket.id)) return;
     secretQueue.set(socket.id, { userId, userName, socketId: socket.id });
@@ -632,12 +619,10 @@ io.on("connection", (socket) => {
     socket.emit("secret-cancelled");
   });
 
-  // ── Transcription relay ───────────────────────────────────────────────────────
+  // ── Transcription ─────────────────────────────────────────────────────────────
   socket.on("transcript-share", ({ roomId, text, speakerName, timestamp }) => {
     socket.to(roomId).emit("transcript-line", { text, speakerName, timestamp });
   });
-
-  // ── Transcription permission ──────────────────────────────────────────────────
   socket.on("host-grant-transcribe", ({ roomId, targetSocketId, allowed }) => {
     if (!isRoomHost(roomId)) return;
     io.to(targetSocketId).emit("transcribe-permission", { allowed });
@@ -667,8 +652,7 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("breakout-callback");
   });
   socket.on("breakout-get", ({ roomId }) => {
-    const session = breakoutSessions.get(roomId);
-    socket.emit("breakout-state", session || null);
+    socket.emit("breakout-state", breakoutSessions.get(roomId) || null);
   });
 
   // ── Polls ─────────────────────────────────────────────────────────────────────
@@ -779,7 +763,6 @@ io.on("connection", (socket) => {
     const meta = socketMeta.get(socket.id);
     if (meta) {
       const { roomId, userId, userName } = meta;
-      // If this user was drawing, broadcast stop to their room
       socket.to(roomId).emit("wb-drawing-stop", { roomId, from: socket.id });
       socket.to(roomId).emit("user-left", { socketId: socket.id, userName });
       if (rooms.has(roomId)) {
@@ -789,24 +772,18 @@ io.on("connection", (socket) => {
           knockQueue.delete(roomId);
           roomPrivacy.delete(roomId);
           roomUserSockets.delete(roomId);
-          // Room is empty — purge host records too
           roomHosts.delete(roomId);
           roomHostSockets.delete(roomId);
+          // Chat auto-cleaned — no deletion logic needed
+          roomMessages.delete(roomId);
         }
       }
-      // Only clear hostSocket mapping if this socket was the current host socket.
-      // Keep roomHosts (userId) so the host can rejoin and be auto-recognized.
-      if (roomHostSockets.get(roomId) === socket.id) {
+      if (roomHostSockets.get(roomId) === socket.id)
         roomHostSockets.delete(roomId);
-      }
-      // Clean up userId → socketId mapping only if it still points to THIS socket.
-      // If the user already reconnected with a new socket the mapping will already
-      // point to the new socketId and we must NOT delete it.
       if (roomUserSockets.has(roomId)) {
         const userSocketMap = roomUserSockets.get(roomId);
-        if (userSocketMap.get(userId) === socket.id) {
+        if (userSocketMap.get(userId) === socket.id)
           userSocketMap.delete(userId);
-        }
       }
       socketMeta.delete(socket.id);
       Room.findOneAndUpdate(
@@ -837,18 +814,3 @@ mongoose
       console.log(`🚀 Server on http://localhost:${PORT} (no DB)`),
     );
   });
-
-// ═══════════════════════════════════════════════════════════════════════════
-// BREAKOUT ROOMS
-// ═══════════════════════════════════════════════════════════════════════════
-const breakoutSessions = new Map();
-
-// ═══════════════════════════════════════════════════════════════════════════
-// POLLS
-// ═══════════════════════════════════════════════════════════════════════════
-const roomPolls = new Map();
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Q&A
-// ═══════════════════════════════════════════════════════════════════════════
-const roomQnA = new Map();
