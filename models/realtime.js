@@ -89,6 +89,14 @@ const presenceSchema = new mongoose.Schema({
 presenceSchema.index({ roomId: 1, userId: 1, connectionId: 1 }, { unique: true });
 presenceSchema.index({ roomId: 1, lastSeen: 1 });
 
+/** One-shot fan-out claim so multi-tab leave doesn't double-publish user-left. */
+const leaveClaimSchema = new mongoose.Schema({
+  roomId: { type: String, required: true },
+  userId: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now, expires: 60 },
+});
+leaveClaimSchema.index({ roomId: 1, userId: 1 }, { unique: true });
+
 function model(name, schema) {
   try {
     return mongoose.model(name);
@@ -107,4 +115,5 @@ module.exports = {
   RoomEvent: model("RoomEvent", roomEventSchema),
   SecretInbox: model("SecretInbox", secretInboxSchema),
   Presence: model("Presence", presenceSchema),
+  LeaveClaim: model("LeaveClaim", leaveClaimSchema),
 };

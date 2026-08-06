@@ -86,4 +86,19 @@ async function runRecordingRetention(_req, res) {
 router.get("/recordings-retention", authorizeCron, runRecordingRetention);
 router.post("/recordings-retention", authorizeCron, runRecordingRetention);
 
+async function runPresenceGc(_req, res) {
+  try {
+    const { gcStalePresence } = require("./lib/events");
+    const result = await gcStalePresence({ limit: 500 });
+    require("./lib/log").info("cron_presence_gc", result);
+    res.json({ ok: true, ...result, at: new Date().toISOString() });
+  } catch (err) {
+    require("./lib/log").error("cron_presence_gc_failed", { err: err.message });
+    res.status(500).json({ error: err.message });
+  }
+}
+
+router.get("/presence-gc", authorizeCron, runPresenceGc);
+router.post("/presence-gc", authorizeCron, runPresenceGc);
+
 module.exports = router;

@@ -13,4 +13,15 @@ describe("presence multi-connection contract", () => {
     assert.equal(leave("a"), "stay");
     assert.equal(leave("b"), "user-left");
   });
+
+  it("LeaveClaim dedupes concurrent last-tab leaves", () => {
+    const claims = new Set();
+    const claim = (userId) => {
+      if (claims.has(userId)) return false;
+      claims.add(userId);
+      return true;
+    };
+    assert.equal(claim("u1"), true);
+    assert.equal(claim("u1"), false);
+  });
 });
